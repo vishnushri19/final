@@ -74,6 +74,28 @@ class AutoSyncSelectionTests(unittest.TestCase):
         self.assertEqual("10.0.0.1", active_host)
         self.assertEqual("application-device-group", group)
 
+    def test_selects_standby_when_connected_with_short_hostname(self):
+        members = [
+            "/Common/active.example.test",
+            "/Common/standby.example.test",
+        ]
+        client = self.client_with_groups(
+            [
+                {
+                    "name": "application-device-group",
+                    "type": "sync-failover",
+                    "devices": members,
+                }
+            ]
+        )
+        client.base_url = "https://standby"
+        client.devices.return_value["items"][1]["selfDevice"] = False
+
+        active_host, group = resolve_active_peer_and_sync_group(client)
+
+        self.assertEqual("10.0.0.1", active_host)
+        self.assertEqual("application-device-group", group)
+
     def test_blocks_when_multiple_sync_failover_groups_match(self):
         members = [
             "/Common/active.example.test",
