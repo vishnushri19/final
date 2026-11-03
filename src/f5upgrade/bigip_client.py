@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import time
 from typing import Any, Dict, Optional
 
@@ -159,7 +160,7 @@ class BigIPClient:
         """
         payload = {
             "command": "run",
-            "utilCmdArgs": f"-c '{command}'",
+            "utilCmdArgs": f"-c {shlex.quote(command)}",
         }
         return self.post("/mgmt/tm/util/bash", payload, timeout=timeout)
 
@@ -171,7 +172,7 @@ class BigIPClient:
         """Execute a bash command through exactly one iControl POST."""
         payload = {
             "command": "run",
-            "utilCmdArgs": f"-c '{command}'",
+            "utilCmdArgs": f"-c {shlex.quote(command)}",
         }
         return self.post_once("/mgmt/tm/util/bash", payload, timeout=timeout)
 
