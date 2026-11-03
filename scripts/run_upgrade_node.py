@@ -14,8 +14,8 @@ from f5upgrade.bigip_client import BigIPClient
 from f5upgrade.config import load_settings
 from f5upgrade.diff_engine import DiffEngine
 from f5upgrade.flow import FlowOptions, UpgradeFlow
-from f5upgrade.ha import manage_auto_sync
-from f5upgrade.report import to_report, write_json, write_markdown
+from f5upgrade.ha import manage_auto_sync, resolve_active_peer_and_sync_group
+from f5upgrade.report import CheckResult, to_report, write_json, write_markdown
 from f5upgrade.state_collector import StateCollector
 from f5upgrade.trace import trace_call
 
@@ -36,6 +36,55 @@ SSH_TIMEOUT = 60
 BACKUP_STAGE_WAIT_SECONDS = int(
     os.environ.get("BACKUP_STAGE_WAIT_SECONDS", "60")
 )
+
+
+def post_upgrade_stabilization_seconds() -> int:
+    """Return the post-boot settling period before state collection."""
+    raw_value = os.environ.get(
+        "POST_UPGRADE_STABILIZATION_SECONDS",
+        "300",
+    ).strip()
+    try:
+        seconds = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "POST_UPGRADE_STABILIZATION_SECONDS must be a whole number."
+        ) from exc
+    if seconds < 0:
+        raise ValueError(
+            "POST_UPGRADE_STABILIZATION_SECONDS cannot be negative."
+        )
+    return seconds
+
+
+def require_operator_go_ahead(crq_number: str) -> CheckResult:
+    """Require documented external approvals before upgrade actions begin."""
+    print(
+        "\n[OPERATOR GATE] Confirm the following before continuing:"
+        f"\n  - The approved maintenance window for {crq_number} is active."
+        "\n  - ATC has recorded its go-ahead in the change record."
+        "\n  - Monitoring alerts are suppressed."
+        "\n  - Required stakeholders were notified and no certificate-renewal "
+        "conflict exists."
+    )
+    answer = input("All confirmations complete? (y/N): ").strip().lower()
+    approved = answer in ("y", "yes")
+    return CheckResult(
+        id="GATE-001",
+        category="Operator Gate",
+        name="External maintenance approvals confirmed",
+        status="PASS" if approved else "FAIL",
+        details={
+            "crq_number": crq_number,
+            "approved": approved,
+            "required_confirmations": [
+                "maintenance_window",
+                "atc_go_ahead",
+                "alerts_suppressed",
+                "stakeholders_notified",
+            ],
+        },
+    )
 
 
 def _safe_host(host: str) -> str:
@@ -625,6 +674,20 @@ def main() -> int:
         )
         return 2
 
+    operator_gate = require_operator_go_ahead(settings.crq_number)
+    if operator_gate.status != "PASS":
+        preflight_results.append(operator_gate)
+        report = to_report(
+            preflight_results,
+            meta={"bigip_host": settings.host, "mode": "preflight"},
+        )
+        flow_json = output_dir / f"upgrade_flow_report_{safe_host}.json"
+        flow_md = output_dir / f"upgrade_flow_report_{safe_host}.md"
+        write_json(str(flow_json), report)
+        write_markdown(str(flow_md), report)
+        print("\n[-] Operator gate was not approved. No backup or upgrade action ran.")
+        return 2
+
     # -------------------------------------------------------------------------
     # STAGE 1: PRE-UPGRADE STATE COLLECTION AND BACKUPS
     # -------------------------------------------------------------------------
@@ -680,13 +743,24 @@ def main() -> int:
         f"{node_count} Nodes."
     )
 
-    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:manage_auto_sync", "Check and, if approved, disable auto-sync")
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:resolve_active_peer_and_sync_group", "Resolve active peer and sync-failover group")
+    active_host, sync_failover_group = resolve_active_peer_and_sync_group(client)
+    active_client = BigIPClient(
+        host=active_host,
+        username=settings.username,
+        password=settings.password,
+        verify_tls=settings.verify_tls,
+        timeout=settings.timeout,
+    )
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:manage_auto_sync", "Disable auto-sync through active peer")
     auto_sync_groups = manage_auto_sync(
-        client,
+        active_client,
         enable=False,
+        groups=[sync_failover_group],
         prompt=(
-            "Auto-sync is enabled. Disable auto-sync before creating "
-            "the UCS/SCF backups and sync the current configuration?"
+            f"Active peer {active_host} will disable auto-sync for "
+            f"{sync_failover_group}, save the configuration, and sync it "
+            "before the standby backup."
         ),
     )
 
@@ -755,6 +829,7 @@ def main() -> int:
     try:
         trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/flow.py:UpgradeFlow.run", "Upload or reuse image, validate license, install, and reboot")
         results = flow.run()
+        results.insert(0, operator_gate)
     finally:
         # The LIC-001 SSH fallback (if it ran) was the last consumer of the
         # shared backup SSH session; close it now regardless of outcome.
@@ -846,7 +921,7 @@ def main() -> int:
         "\n[STAGE 3/4] Collecting Post-Upgrade State..."
     )
 
-    stabilization_seconds = 180
+    stabilization_seconds = post_upgrade_stabilization_seconds()
     print(
         "\nWaiting "
         f"{stabilization_seconds} seconds for VIPs, pools, and nodes "
@@ -863,17 +938,12 @@ def main() -> int:
     print("\n[+] Stabilization wait completed.")
     StateCollector(client).display_ltm_health_summary()
 
-    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:manage_auto_sync", "Check and, if approved, restore auto-sync")
-    manage_auto_sync(
-        client,
-        enable=True,
-        groups=auto_sync_groups,
-        prompt=(
-            "Auto-sync was disabled by this upgrade workflow. Re-enable "
-            "it for those same device groups before collecting the "
-            "post-upgrade state?"
-        ),
-    )
+    if auto_sync_groups:
+        print(
+            "\n[i] Auto-sync remains disabled. Re-enable it only after both "
+            "HA units are upgraded, the authoritative configuration is "
+            "identified, and final ConfigSync is confirmed."
+        )
 
     post_json = (
         snapshots_dir

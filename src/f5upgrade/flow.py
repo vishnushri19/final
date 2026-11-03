@@ -538,10 +538,7 @@ class UpgradeFlow:
             bool(install_name)
             and install_name.lower().startswith("hotfix-bigip-")
         )
-        volume_state = storage_result.details.get("volume_state", {})
-        create_volume = not bool(volume_state) and not bool(
-            storage_result.details.get("deleted_volume")
-        )
+        create_volume = True
 
         # Install to target volume (standby only)
         trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_install_standby", "Submit software installation to target volume")

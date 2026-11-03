@@ -3,12 +3,114 @@ from __future__ import annotations
 import shlex
 import sys
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from .bigip_client import BigIPClient
 from .discovery import discover_devices
 
 
 AUTO_SYNC_EXCLUDED_GROUPS = frozenset({"device_trust_group"})
+
+
+def _group_contains_members(
+    client: BigIPClient,
+    group: dict[str, Any],
+    members: set[str],
+) -> bool:
+    """Verify group membership from REST subcollections or a read-only tmsh query."""
+    group_name = str(group.get("name", "")).strip()
+    if not group_name:
+        return False
+
+    def contains_members(value: Any) -> bool:
+        return all(member in str(value).lower() for member in members)
+
+    if "devices" in group and contains_members(group["devices"]):
+        return True
+
+    reference = group.get("devicesReference")
+    if isinstance(reference, dict):
+        link = str(reference.get("link", "")).strip()
+        path = urlsplit(link).path
+        if path.startswith("/mgmt/"):
+            try:
+                payload = client.get(path)
+                if contains_members(payload):
+                    return True
+            except Exception:
+                pass
+
+    try:
+        response = client.run_bash(
+            "tmsh -q list cm device-group "
+            f"{shlex.quote(group_name)} devices",
+            timeout=30,
+        )
+        return contains_members(response.get("commandResult", ""))
+    except Exception:
+        return False
+
+
+def resolve_active_peer_and_sync_group(
+    client: BigIPClient,
+) -> tuple[str, str]:
+    """Resolve the active peer and its single non-hidden sync-failover group."""
+    local_name, devices = discover_devices(client)
+    if not local_name:
+        raise RuntimeError("Could not identify the local standby device.")
+
+    active = [
+        device
+        for device in devices
+        if str(device.get("failoverState", "")).lower() == "active"
+    ]
+    if len(active) != 1:
+        raise RuntimeError(
+            "Expected exactly one active peer; found "
+            f"{[device.get('name') for device in active]}."
+        )
+
+    active_host = str(
+        active[0].get("managementIp")
+        or active[0].get("managementAddress")
+        or ""
+    ).split("/", 1)[0]
+    if not active_host:
+        raise RuntimeError("Active peer has no management address.")
+
+    def normalized(values: list[str]) -> set[str]:
+        return {
+            value.strip().lower().split(".", 1)[0].split("/")[-1]
+            for value in values
+            if value and value.strip()
+        }
+
+    members = normalized(
+        [
+            local_name,
+            str(active[0].get("name") or ""),
+            str(active[0].get("hostname") or ""),
+        ]
+    )
+    payload = client.get("/mgmt/tm/cm/device-group")
+    groups = payload.get("items", []) if isinstance(payload, dict) else []
+    matches = []
+    for group in groups:
+        if (
+            not isinstance(group, dict)
+            or str(group.get("type", "")).lower() != "sync-failover"
+            or str(group.get("hidden", "")).lower() in ("true", "yes", "enabled")
+        ):
+            continue
+        if _group_contains_members(client, group, members):
+            matches.append(str(group.get("name", "")))
+
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one non-hidden sync-failover group containing "
+            f"the active and standby devices; found {matches}."
+        )
+    return active_host, matches[0]
 
 
 def get_failover_role(client: BigIPClient) -> Optional[str]:
@@ -225,6 +327,16 @@ def manage_auto_sync(
             )
 
     if not enable:
+        save_response = client.run_bash("tmsh save sys config partitions all")
+        save_output = str(save_response.get("commandResult", "")).strip()
+        if save_output and any(
+            marker in save_output.lower()
+            for marker in ("error", "failed", "syntax", "invalid", "conflict")
+        ):
+            raise RuntimeError(
+                f"Could not save configuration before disabling auto-sync: "
+                f"{save_output}"
+            )
         for group in groups_to_change:
             command = (
                 "tmsh run cm config-sync to-group "

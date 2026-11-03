@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -134,6 +135,7 @@ class StateCollector:
             "interface_stats": self._collect_interfaces(),
             "system_performance": self._collect_performance(),
             "crypto_inventory": self._collect_crypto_inventory(),
+            "platform_inventory": self._collect_platform_inventory(),
             "bgp_inventory": self._collect_bgp_inventory(),
             "operational_evidence": self._collect_operational_evidence(),
             "ltm_raw_all_partitions": self._collect_ltm_raw_all_partitions(),
@@ -260,6 +262,17 @@ class StateCollector:
                 "public_key_count": fips_counts.get("public keys"),
                 "raw_output": fips_output,
             },
+        }
+
+    def _collect_platform_inventory(self) -> Dict[str, Any]:
+        """Capture provisioning and compare license state without storing it."""
+        provisioning = self.run_tmsh("tmsh list sys provision")
+        license_output = self.run_tmsh("tmsh show sys license")
+        return {
+            "provisioning": provisioning,
+            "license_sha256": hashlib.sha256(
+                license_output.encode("utf-8")
+            ).hexdigest(),
         }
 
     # ---------------- Common Helpers ----------------

@@ -69,6 +69,18 @@ class DiffEngine:
                 "pre": self.pre.get("bgp_inventory", {}),
                 "post": self.post.get("bgp_inventory", {}),
             },
+            "platform_inventory": {
+                "pre": self.pre.get("platform_inventory", {}),
+                "post": self.post.get("platform_inventory", {}),
+                "provisioning_changed": (
+                    self.pre.get("platform_inventory", {}).get("provisioning")
+                    != self.post.get("platform_inventory", {}).get("provisioning")
+                ),
+                "license_changed": (
+                    self.pre.get("platform_inventory", {}).get("license_sha256")
+                    != self.post.get("platform_inventory", {}).get("license_sha256")
+                ),
+            },
         }
 
     @staticmethod

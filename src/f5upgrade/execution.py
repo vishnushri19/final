@@ -888,25 +888,6 @@ def prepare_install_storage(
             },
         )
 
-    if (
-        expected_image_contains
-        and expected_image_contains.lower() in existing.version.lower()
-        and "complete" in existing.status.lower()
-    ):
-        print(
-            f"\nTarget volume {target_volume} already contains the requested "
-            f"version {existing.version}; it will be reused."
-        )
-        details["volume_state"] = existing.__dict__
-        details["reused_volume"] = True
-        return CheckResult(
-            id=result_id,
-            category="Execution Readiness",
-            name=result_name,
-            status="PASS",
-            details=details,
-        )
-
     print(f"\nTarget volume {target_volume} contains version {existing.version or '(unknown)'} with status '{existing.status}'.")
     if not sys.stdin.isatty():
         return CheckResult(
@@ -1212,8 +1193,29 @@ def exec_install_standby(
 
     expected_version = _extract_version_from_image_name(image_iso_name)
     existing = _get_volume_state(client, target_volume)
+    if create_volume is None:
+        create_volume = not existing.found
 
     if existing.found:
+        if create_volume:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "chosen_volume": target_volume,
+                    "error": (
+                        "Target volume still exists after storage preparation; "
+                        "refusing to reuse a volume that may not contain the "
+                        "current configuration."
+                    ),
+                    "volume_state": existing.__dict__,
+                },
+            )
+
         status = existing.status.lower()
         version_matches = bool(expected_version and expected_version in existing.version)
         progress_states = ["installing", "complete", "testing", "copying", "pending", "waiting", "validating"]
@@ -1261,9 +1263,6 @@ def exec_install_standby(
         )
 
     install_type = "hotfix" if _is_hotfix_image(image_name) else "image"
-    if create_volume is None:
-        create_volume = not existing.found
-
     image_path = f"/shared/images/{image_name}"
     tmsh_command = f"cd /shared/images && tmsh install sys software {install_type} {_shell_quote(image_name)} volume {_shell_quote(target_volume)}"
     if create_volume:
@@ -1653,7 +1652,7 @@ def exec_reboot_to_volume_standby(
     print(tmsh_command)
 
     try:
-        response = client.run_bash(tmsh_command, timeout=60)
+        response = client.run_bash_once(tmsh_command, timeout=60)
         return CheckResult(
             id=result_id,
             category="Execution",

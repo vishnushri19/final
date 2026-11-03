@@ -23,6 +23,7 @@ from f5upgrade.execution import (  # noqa: E402
     check_image_present,
     check_license_dates,
     exec_install_standby,
+    exec_reboot_to_volume_standby,
     exec_upload_iso_standby,
 )
 from f5upgrade.flow import UpgradeFlow  # noqa: E402
@@ -445,6 +446,27 @@ class InstallSubmissionTests(unittest.TestCase):
         self.assertEqual("FAIL", result.status)
         self.assertEqual(0, client.run_bash_once_calls)
 
+    def test_existing_volume_is_not_reused_when_fresh_creation_is_required(self):
+        client = FakeInstallClient()
+
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch(
+                "f5upgrade.execution._get_volume_state",
+                return_value=installing_volume(),
+            ),
+        ):
+            result = exec_install_standby(
+                client,
+                self.image,
+                self.volume,
+                create_volume=True,
+            )
+
+        self.assertEqual("FAIL", result.status)
+        self.assertIn("refusing to reuse", result.details["error"])
+        self.assertEqual(0, client.run_bash_once_calls)
+
     def test_timeout_with_installing_volume_does_not_submit_over_ssh(self):
         client = FakeInstallClient(
             rest_error=requests.exceptions.ReadTimeout("ambiguous timeout")
@@ -517,6 +539,22 @@ class InstallSubmissionTests(unittest.TestCase):
         self.assertEqual(1, client.run_bash_once_calls)
         ssh_submit.assert_not_called()
         self.assertFalse(result.details["automatic_resubmission"])
+
+
+class RebootSubmissionTests(unittest.TestCase):
+    def test_reboot_is_submitted_once(self):
+        client = Mock()
+        client.run_bash_once.return_value = {"commandResult": ""}
+
+        with patch("f5upgrade.execution.get_failover_role", return_value="standby"):
+            result = exec_reboot_to_volume_standby(client, "HD1.1")
+
+        self.assertEqual("PASS", result.status)
+        client.run_bash_once.assert_called_once_with(
+            "tmsh reboot volume HD1.1",
+            timeout=60,
+        )
+        client.run_bash.assert_not_called()
 
 
 if __name__ == "__main__":
